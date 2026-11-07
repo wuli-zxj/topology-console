@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网络拓扑 · 接口测试控制台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <div><div class="brand-t">网络拓扑管理</div><div class="brand-s">接口测试控制台</div></div>
+  </div>
+  <div class="topinfo">
+    <span class="dot" id="healthDot"></span>
+    <span id="healthText">检测后端中…</span>
+    <code id="backendAddr">—</code>
+    <a href="http://localhost:8080/swagger-ui/index.html" target="_blank" rel="noreferrer">Swagger 文档 ↗</a>
+    <button class="btn btn-ghost btn-sm" id="btnRefreshAll">刷新数据</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav class="nav" id="nav">
+      <button class="nav-i active" data-view="overview"><span>◉</span> 拓扑总览</button>
+      <button class="nav-i" data-view="create"><span>＋</span> 新增节点</button>
+      <button class="nav-i" data-view="link"><span>⇄</span> 连接管理</button>
+      <button class="nav-i" data-view="ringlinks"><span>◎</span> 环网链路</button>
+      <button class="nav-i" data-view="ports"><span>▤</span> 端口管理</button>
+      <button class="nav-i" data-view="debug"><span>⌘</span> 接口调试</button>
+    </nav>
+
+    <div class="side-head">
+      <div class="side-title">节点列表 <span class="badge" id="nodeCount">0</span></div>
+      <input class="input input-sm" id="listSearch" placeholder="搜索名称 / IP / 地点">
+      <select class="input input-sm" id="listType">
+        <option value="">全部类型</option>
+        <option value="SWITCH">交换机</option>
+        <option value="CAMERA">摄像头</option>
+        <option value="BROADCAST">广播</option>
+        <option value="PERSONNEL">人员定位</option>
+        <option value="NVR">NVR 显示器</option>
+        <option value="SIGNAL">生产信号</option>
+      </select>
+    </div>
+    <div class="node-list" id="nodeList"><div class="empty">加载中…</div></div>
+  </aside>
+
+  <main class="main">
+
+    <!-- ============ 拓扑总览 ============ -->
+    <section class="panel active" data-panel="overview">
+      <div class="panel-head">
+        <div><h1>拓扑总览</h1>
+          <p><b>◉ 环形</b> 展示核心层 STP 环网（弧上标注相接端口，下方列出每台设备的已用 / 空闲端口）；<b>☰ 树形</b> 展示采区树，<b>每棵树的根节点就是采区变电所</b>，并按「<b>上级下联端口 ↔ 下级接入端口</b>」成对连线，空闲端口也单独展示。两种查询相互独立：<b>查询当前节点链路</b>只返回选中节点所属的那棵采区树；<b>查询完整链路</b>调用 <code>/api/topology/full</code> 显示全部采区树。</p></div>
+        <div class="head-actions">
+          <button class="btn btn-ghost" id="btnRefreshStatus">⟳ 刷新状态缓存</button>
+          <div class="view-switch" role="group" aria-label="拓扑展示方式">
+            <button class="btn btn-sm btn-outline" id="btnViewTree">☰ 树形</button>
+            <button class="btn btn-sm btn-primary" id="btnViewRing">◉ 环形</button>
+          </div>
+          <button class="btn btn-outline" id="btnChain">查询当前节点链路</button>
+          <button class="btn btn-primary" id="btnFullChain">查询完整链路</button>
+        </div>
+      </div>
+
+      <div class="rule mode-tip" id="chainModeTip">当前查询：查询当前节点链路</div>
+
+      <div class="card">
+        <div class="card-title" id="chainSummaryTitle">链路摘要 <span class="hint">完整链路</span></div>
+        <div id="chainSummary" class="summary">点击左侧列表选择节点，然后点「查询当前节点链路」；或点「查询完整链路」查看全部独立树。</div>
+      </div>
+
+      <!-- 环形拓扑视图：RING 环网按环上顺序还原成真正的圆环 -->
+      <div class="card" id="ringCard">
+        <div class="card-title">环网拓扑图 <span class="hint">按闭环顺序排布 · 弧线为环上链路 · 点击节点查看详情</span>
+          <label class="ring-opt"><input type="checkbox" id="chkRingPorts" checked> 显示端口标注</label>
+        </div>
+        <div id="ringLegend" class="ring-legend"></div>
+        <div id="ringCanvas" class="ring-canvas"><div class="empty">正在生成环形拓扑…</div></div>
+        <div id="ringNote" class="ring-note"></div>
+        <details class="ring-ports" id="ringPortsBox" open>
+          <summary>设备端口清单 <span class="hint">已接链路 / 空闲端口 · 悬停查看对端</span></summary>
+          <div id="ringPortList"></div>
+        </details>
+      </div>
+
+      <div class="two-col ring-mode" id="chainCols">
+        <div class="card" id="treeCard" hidden>
+          <div class="card-title" id="chainTreeTitle">采区树 · 全部采区 <span class="hint">根节点为采区变电所 · 端口直连 / 成对连线 · 点击节点查看详情</span></div>
+          <div class="tree-note" id="treeNote"></div>
+          <div class="pg-legend" id="portLegend"></div>
+          <div id="chainTree" class="tree"><div class="empty">暂无数据</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">节点详情 <span class="hint" id="detailTitle">未选择</span></div>
+          <div id="nodeDetail"><div class="empty">请选择一个节点</div></div>
+          <div class="card-title" style="margin-top:18px">设备状态</div>
+          <div id="nodeStatus"><div class="empty">点击「查询设备状态」进行 ICMP 探测</div></div>
+          <button class="btn btn-outline btn-sm" id="btnPing" style="margin-top:10px">查询设备状态</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 新增节点 ============ -->
+    <section class="panel" data-panel="create">
+      <div class="panel-head">
+        <div><h1>新增节点</h1><p>节点级别：0=核心环网专属（只在环网视图展示）/ 1=采区一级节点（配电室、变电所）/ ≥2=采区内部设备。级别与「是否环网成员」相互独立；留空时按上级自动推导。<b>拓扑类型选「环网」时请在「接入环网」里选插入位置，节点会直接进闭环，而不是挂成某个变电所的下级。</b></p></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">基本信息</div>
+        <div class="form-grid">
+          <label>设备名称 <b>*</b><input class="input" id="c_name" placeholder="如：东区汇聚交换机"></label>
+          <label>设备类型 <b>*</b><select class="input" id="c_type"><option value="SWITCH">交换机</option><option value="CAMERA">摄像头</option><option value="BROADCAST">广播</option><option value="PERSONNEL">人员定位</option><option value="NVR">NVR 显示器</option><option value="SIGNAL">生产信号</option></select></label>
+          <label>拓扑类型 <b>*</b><select class="input" id="c_topo"><option value="TREE">树形（采区内部）</option><option value="RING">环网（核心 STP）</option></select></label>
+          <label>节点级别 <span class="hint">与环网身份相互独立</span>
+            <select class="input" id="c_level">
+              <option value="">自动推导（无上级=一级，有上级=上级+1）</option>
+              <option value="0">0 · 核心环网专属（不进采区树）</option>
+              <option value="1">1 · 采区一级节点（配电室/变电所）</option>
+              <option value="2">2 · 采区二级设备</option>
+              <option value="3">3 · 采区三级设备</option>
+            </select>
+          </label>
+          <label>设备型号<input class="input" id="c_model" placeholder="如：H3C S5130S-28P"></label>
+          <label>安装地点<input class="input" id="c_location" placeholder="如：东区弱电间"></label>
+          <label>IP 地址<input class="input" id="c_ip" placeholder="如：10.0.2.1"></label>
+        </div>
+      </div>
+
+      <div class="card" id="c_parentCard">
+        <div class="card-title">上级连接 <span class="hint">仅树形（采区内部）节点使用；留空「上级设备」即创建独立节点</span></div>
+        <div class="form-grid">
+          <label>上级设备<select class="input" id="c_parent"><option value="">（不接入，作为独立一级节点）</option></select></label>
+          <label>上级端口 <span class="hint">上级为交换机时必填</span><select class="input" id="c_parentPort" disabled><option value="">无需 / 请先选上级</option></select></label>
+          <label>本机接入端口 <span class="hint">本级为交换机时必填</span><input class="input" id="c_inbound" list="c_portNoList" placeholder="如：XGE0/1"><datalist id="c_portNoList"></datalist></label>
+        </div>
+        <div class="rule" id="c_rule">规则：交换机上级只能是交换机；上级是交换机需记录上级端口，上级是摄像头/广播只记录 IP；本级是交换机需记录本机接入端口。</div>
+      </div>
+
+      <div class="card" id="c_ringCard" style="display:none">
+        <div class="card-title">接入环网 <span class="hint">在选定的环上链路中间插入本节点，闭环自动扩大</span></div>
+        <div class="rule">环网节点<b>不设上级</b>、不写 <code>parent_id</code>：系统把选中的链路 A ↔ B 拆成 <b>A ↔ 新节点 ↔ B</b> 两条链路，新节点立即进入闭环并出现在「◉ 环形」图上。新节点必须是交换机；下方两个本机端口需先在「端口清单」中登记。</div>
+        <div class="form-grid">
+          <label>插入位置（拆哪条环边） <b>*</b><select class="input" id="c_insertLink"><option value="">请选择环上链路</option></select></label>
+          <label>新节点连 A 端的端口 <span class="hint">须在端口清单中</span><input class="input" id="c_ringPortA" list="c_portNoList" placeholder="如：XGE0/1"></label>
+          <label>新节点连 B 端的端口 <span class="hint">须在端口清单中</span><input class="input" id="c_ringPortB" list="c_portNoList" placeholder="如：XGE0/2"></label>
+          <label>备注<input class="input" id="c_ringRemark" placeholder="可选，如：新增十五采区变电所"></label>
+        </div>
+      </div>
+
+      <div class="card" id="c_portsCard">
+        <div class="card-title">端口清单 <span class="hint">仅交换机可配置；新增时一并创建</span></div>
+        <div class="port-rows" id="c_portRows"></div>
+        <button class="btn btn-outline btn-sm" id="btnAddPortRow">＋ 添加端口</button>
+      </div>
+
+      <div class="action-row">
+        <button class="btn btn-primary" id="btnCreate">提交新增</button>
+        <button class="btn btn-ghost" id="btnCreateReset">清空表单</button>
+        <span class="hint" id="c_hint"></span>
+      </div>
+      <div class="card"><div class="card-title">响应结果</div><pre class="code" id="createResult">尚未提交</pre></div>
+    </section>
+
+    <!-- ============ 连接管理 ============ -->
+    <section class="panel" data-panel="link">
+      <div class="panel-head"><div><h1>连接管理</h1><p>修改描述、断开上级、接入上级、删除节点。断开/接入都不会影响该节点已有的子连接；<b>核心层环网互联请到「环网链路」页维护</b>。</p></div></div>
+
+      <div class="card">
+        <div class="card-title">当前操作节点</div>
+        <select class="input" id="l_node" style="max-width:460px"></select>
+        <div id="l_current" class="summary" style="margin-top:12px">请选择一个节点</div>
+      </div>
+
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title">① 修改描述信息</div>
+          <div class="rule" style="margin:0 0 12px">仅可修改 <b>设备名称 / 设备型号 / 安装地点</b>；设备 IP 与设备类型不可修改（后端已锁定这两个字段）。</div>
+          <div class="form-grid one">
+            <label>设备名称 <span class="hint">可修改</span><input class="input" id="u_name"></label>
+            <label>设备类型 <span class="hint">不可修改</span><select class="input" id="u_type" disabled><option value="SWITCH">交换机</option><option value="CAMERA">摄像头</option><option value="BROADCAST">广播</option><option value="PERSONNEL">人员定位</option><option value="NVR">NVR 显示器</option><option value="SIGNAL">生产信号</option></select></label>
+            <label>设备型号 <span class="hint">可修改</span><input class="input" id="u_model"></label>
+            <label>安装地点 <span class="hint">可修改</span><input class="input" id="u_location"></label>
+            <label>IP 地址 <span class="hint">不可修改</span><input class="input" id="u_ip" disabled></label>
+          </div>
+          <button class="btn btn-primary btn-sm" id="btnUpdate">保存修改</button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">② 断开 / 接入上级</div>
+          <div class="sub-block">
+            <p class="muted">断开只清空本节点的上级信息，子节点连接保持不变。</p>
+            <button class="btn btn-outline btn-sm" id="btnDetach">断开上级连接</button>
+          </div>
+          <div class="sub-block">
+            <p class="muted">接入到新上级，本节点已有的子连接保持不变。</p>
+            <div class="form-grid one">
+              <label>上级设备 IP <b>*</b><select class="input" id="l_parent"></select></label>
+              <label>上级端口<select class="input" id="l_parentPort" disabled><option value="">无需 / 请先选上级</option></select></label>
+              <label>本机接入端口<input class="input" id="l_inbound" placeholder="如：XGE0/1"></label>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btnAttach">接入上级</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card danger-card">
+        <div class="card-title">③ 删除节点</div>
+        <p class="muted">存在任何子节点、或该设备仍被 ring_link 环网链路引用时，后端会拒绝删除（需先断开子节点，或到「环网链路」页移除相关链路）。</p>
+        <button class="btn btn-danger btn-sm" id="btnDelete">删除当前节点</button>
+      </div>
+
+      <div class="card"><div class="card-title">响应结果</div><pre class="code" id="linkResult">尚未操作</pre></div>
+    </section>
+
+    <!-- ============ 环网链路 ============ -->
+    <section class="panel" data-panel="ringlinks">
+      <div class="panel-head"><div><h1>环网链路</h1><p>维护 <code>ring_link</code> 表中的核心层 STP 物理光纤链路，这是环网互联的<b>唯一权威数据源</b>。<code>GET /api/topology/ring</code> 直接读这张表还原闭环与直连弦；设备节点上不再保存对端字段。</p></div>
+        <div class="head-actions"><button class="btn btn-outline" id="btnReloadRingLinks">⟳ 刷新链路</button></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">链路清单 <span class="badge" id="ringLinkCount">0</span> <span class="hint">链路不区分方向，落库统一按较小 id 在前</span></div>
+        <div style="overflow-x:auto"><table class="tbl" id="rl_table"><thead><tr>
+          <th>ID</th><th>环</th><th>序</th><th>A 端设备 / 端口</th><th>B 端设备 / 端口</th><th>类型</th><th>备注</th><th>操作</th>
+        </tr></thead><tbody><tr><td colspan="8" class="empty">加载中…</td></tr></tbody></table></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title" id="rl_formTitle">新增环网链路</div>
+        <div class="rule">两端必须是交换机且不能相同；端口可选，填写时端口必须属于对应设备；<code>linkType=RING</code> 参与闭环，<code>CHORD</code> 为不参与闭环的跨环直连（如双核心互联）。同一对设备只能有一条链路。</div>
+        <div class="form-grid">
+          <label>环编号<select class="input" id="rl_ringNo">
+            <option value="GREEN">GREEN · 绿色左环</option>
+            <option value="RED">RED · 红色右环</option>
+            <option value="CORE">CORE · 核心直连</option>
+            <option value="MAIN">MAIN · 其它</option>
+          </select></label>
+          <label>环上顺序 <span class="hint">CHORD 可留空</span><input class="input" id="rl_seqNo" type="number" min="1" placeholder="如：1"></label>
+          <label>链路类型<select class="input" id="rl_linkType"><option value="RING">RING · 环上链路</option><option value="CHORD">CHORD · 直连弦</option></select></label>
+          <label>A 端设备 <b>*</b><select class="input" id="rl_from"><option value="">请选择交换机</option></select></label>
+          <label>A 端端口<select class="input" id="rl_fromPort"><option value="">（不指定端口）</option></select></label>
+          <label>B 端设备 <b>*</b><select class="input" id="rl_to"><option value="">请选择交换机</option></select></label>
+          <label>B 端端口<select class="input" id="rl_toPort"><option value="">（不指定端口）</option></select></label>
+          <label>备注<input class="input" id="rl_remark" placeholder="可选，如：左环 1：核心一主 ↔ 一中央变电所"></label>
+        </div>
+        <div class="action-row">
+          <button class="btn btn-primary btn-sm" id="btnRingLinkSave">保存链路</button>
+          <button class="btn btn-ghost btn-sm" id="btnRingLinkCancel" style="display:none">取消编辑</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">环网调整 <span class="hint">单事务执行，失败自动回滚；完成后立即重算闭环</span></div>
+        <div class="rule"><b>摘除节点</b>：删除该设备全部环网链路（含直连弦），并把它在环上的两个邻居直连成一条新链路，端口继承两条旧链路在邻居侧的值，闭环保持不变。<b>改接链路</b>：把选中链路的一端换到另一台交换机，旧链路删除、新链路创建在同一事务内完成。</div>
+        <div class="form-grid" style="margin-bottom:12px">
+          <label>操作类型<select class="input" id="ra_op">
+            <option value="bypass">摘除节点 · 邻居自动直连</option>
+            <option value="rewire">改接链路一端</option>
+          </select></label>
+        </div>
+
+        <div id="ra_bypass">
+          <div class="form-grid">
+            <label>要摘除的环网节点 <b>*</b><select class="input" id="ra_bp_node"></select></label>
+            <label>新链路备注<input class="input" id="ra_bp_remark" placeholder="可选，留空自动生成"></label>
+          </div>
+          <div class="rule" id="ra_bp_preview">选择节点后显示将要删除与新建的链路</div>
+          <div class="action-row"><button class="btn btn-primary btn-sm" id="ra_bp_exec">执行摘除</button></div>
+        </div>
+
+        <div id="ra_rewire" hidden>
+          <div class="form-grid">
+            <label>要改接的链路 <b>*</b><select class="input" id="ra_rw_link"></select></label>
+            <label>被替换的一端 <b>*</b><select class="input" id="ra_rw_old"></select></label>
+            <label>新接入交换机 <b>*</b><select class="input" id="ra_rw_new"></select></label>
+            <label>新设备侧端口<select class="input" id="ra_rw_newPort"><option value="">（不指定端口）</option></select></label>
+            <label>保留侧端口<select class="input" id="ra_rw_keepPort"><option value="">（继承原端口）</option></select></label>
+            <label>备注<input class="input" id="ra_rw_remark" placeholder="可选，留空继承原备注"></label>
+          </div>
+          <div class="rule" id="ra_rw_preview">选择链路后显示改接前后对比</div>
+          <div class="action-row"><button class="btn btn-primary btn-sm" id="ra_rw_exec">执行改接</button></div>
+        </div>
+        <div style="margin-top:12px"><div class="card-title">调整结果</div><pre class="code" id="ra_result">尚未操作</pre></div>
+      </div>
+      <div class="card"><div class="card-title">响应结果</div><pre class="code" id="ringLinkResult">尚未操作</pre></div>
+    </section>
+
+    <!-- ============ 端口管理 ============ -->
+    <section class="panel" data-panel="ports">
+      <div class="panel-head"><div><h1>端口管理</h1><p>交换机端口的光口 / 电口维护；<b>修改端口时只允许改备注</b>，端口号、类型、状态不可改。端口状态查询为预留能力（当前返回占位值）。</p></div></div>
+      <div class="card">
+        <div class="card-title">选择交换机</div>
+        <select class="input" id="p_switch" style="max-width:460px"></select>
+        <div style="overflow-x:auto;margin-top:14px"><table class="tbl" id="p_table"><thead><tr><th>ID</th><th>端口号</th><th>类型</th><th>状态</th><th>备注</th><th>操作</th></tr></thead><tbody><tr><td colspan="6" class="empty">请选择交换机</td></tr></tbody></table></div>
+      </div>
+      <div class="card">
+        <div class="card-title" id="p_formTitle">新增端口</div>
+        <div class="rule" id="p_editInfo" style="display:none"></div>
+        <div class="form-grid">
+          <label>端口号 <b>*</b> <span class="hint">仅新增时可填</span><input class="input" id="p_portNo" placeholder="如：GE0/3"></label>
+          <label>端口类型 <b>*</b> <span class="hint">仅新增时可填</span><select class="input" id="p_portType"><option value="ELECTRICAL">电口</option><option value="OPTICAL">光口</option></select></label>
+          <label>状态 <span class="hint">预留字段，暂不可写</span><input class="input" id="p_status" placeholder="UNKNOWN（预留）" disabled></label>
+          <label>备注 <span class="hint">修改时唯一可写字段，留空可清空</span><input class="input" id="p_remark" placeholder="可选"></label>
+        </div>
+        <div class="action-row">
+          <button class="btn btn-primary btn-sm" id="btnPortSave">新增端口</button>
+          <button class="btn btn-ghost btn-sm" id="btnPortCancel" style="display:none">取消编辑</button>
+        </div>
+      </div>
+      <div class="card"><div class="card-title">响应结果</div><pre class="code" id="portResult">尚未操作</pre></div>
+    </section>
+
+    <!-- ============ 接口调试 ============ -->
+    <section class="panel" data-panel="debug">
+      <div class="panel-head"><div><h1>接口调试</h1><p>直接发送任意请求，查看原始响应。所有 /api 请求经本地代理转发到后端。</p></div></div>
+      <div class="card">
+        <div class="card-title">快捷接口</div>
+        <div class="chips" id="quickApis"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">构造请求</div>
+        <div class="req-line">
+          <select class="input" id="d_method"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select>
+          <input class="input" id="d_path" value="/api/nodes?size=20" placeholder="/api/...">
+          <button class="btn btn-primary" id="btnSend">发送请求</button>
+        </div>
+        <label class="block-label">请求体 JSON（GET / DELETE 可留空）</label>
+        <textarea class="input code-area" id="d_body" placeholder='{"deviceName":"测试节点","deviceType":"BROADCAST"}'></textarea>
+      </div>
+      <div class="card">
+        <div class="card-title">响应 <span class="hint" id="d_meta">—</span></div>
+        <pre class="code" id="d_result">尚未发送请求</pre>
+      </div>
+      <div class="card"><div class="card-title">最近请求 <span class="hint">点击回填</span></div><div id="d_history" class="chips"><span class="muted">暂无记录</span></div></div>
+    </section>
+
+  </main>
+</div>
+
+<footer class="statusbar"><span id="footStatus">就绪</span><span class="spacer"></span><span>前端 :5173 · 后端 :8080 · 零依赖</span></footer>
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "topology-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "网络拓扑管理系统 - 图形化接口测试控制台",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

@@ -257,11 +257,12 @@
       </div>
       <div class="card">
         <div class="card-title">环网调整 <span class="hint">单事务执行，失败自动回滚；完成后立即重算闭环</span></div>
-        <div class="rule"><b>摘除节点</b>：删除该设备全部环网链路（含直连弦），并把它在环上的两个邻居直连成一条新链路，端口继承两条旧链路在邻居侧的值，闭环保持不变。<b>改接链路</b>：把选中链路的一端换到另一台交换机，旧链路删除、新链路创建在同一事务内完成。</div>
+        <div class="rule"><b>摘除节点</b>：删除该设备全部环网链路（含直连弦），并把它在环上的两个邻居直连成一条新链路，端口继承两条旧链路在邻居侧的值，闭环保持不变。<b>改接链路</b>：把选中链路的一端换到另一台交换机，旧链路删除、新链路创建在同一事务内完成。<b>新增小环</b>：在选定的主环节点上挂一个 <code>SUBn</code> 附属小环，自动建两台交换机、端口与三条闭环链路，8 字图上会向外鼓出一个小圆。</div>
         <div class="form-grid" style="margin-bottom:12px">
           <label>操作类型<select class="input" id="ra_op">
             <option value="bypass">摘除节点 · 邻居自动直连</option>
             <option value="rewire">改接链路一端</option>
+            <option value="subring">新增小环 · 挂在主环节点上</option>
           </select></label>
         </div>
 
@@ -285,6 +286,23 @@
           </div>
           <div class="rule" id="ra_rw_preview">选择链路后显示改接前后对比</div>
           <div class="action-row"><button class="btn btn-primary btn-sm" id="ra_rw_exec">执行改接</button></div>
+        </div>
+
+        <div id="ra_subring" hidden>
+          <div class="rule">小环结构：<b>挂接节点 ↔ 小环交换机A ↔ 小环交换机B ↔ 挂接节点</b>，三条链路同为 <code>ring_no=SUBn</code>、<code>seq_no=1/2/3</code>、<code>RING</code> 类型，组内自闭环；后端单事务创建，失败整体回滚。下拉只列出 <b>8 字主环上的非核心节点</b>；环编号留空自动分配下一个 <code>SUBn</code>，端口由后端自动挑选空闲光口，不会占用已有端口。</div>
+          <div class="form-grid">
+            <label>挂接节点 <b>*</b><select class="input" id="ra_sr_anchor"></select></label>
+            <label>小环编号 <span class="hint">留空自动分配</span><input class="input" id="ra_sr_ringNo" placeholder="如：SUB2"></label>
+            <label>A 设备名称<input class="input" id="ra_sr_aName" placeholder="留空自动生成"></label>
+            <label>A 设备 IP <span class="hint">可选</span><input class="input" id="ra_sr_aIp" placeholder="如：10.10.0.23"></label>
+            <label>B 设备名称<input class="input" id="ra_sr_bName" placeholder="留空自动生成"></label>
+            <label>B 设备 IP <span class="hint">可选</span><input class="input" id="ra_sr_bIp" placeholder="如：10.10.0.24"></label>
+            <label>设备型号 <span class="hint">两台共用，可选</span><input class="input" id="ra_sr_model" placeholder="默认 H3C S5560X-30C-EI"></label>
+            <label>安装位置 <span class="hint">两台共用，可选</span><input class="input" id="ra_sr_location" placeholder="留空按环编号生成"></label>
+            <label>备注<input class="input" id="ra_sr_remark" placeholder="可选，写进端口与链路备注"></label>
+          </div>
+          <div class="rule" id="ra_sr_preview">选择挂接节点后显示将要创建的小环结构</div>
+          <div class="action-row"><button class="btn btn-primary btn-sm" id="ra_sr_exec">新增小环</button></div>
         </div>
         <div style="margin-top:12px"><div class="card-title">调整结果</div><pre class="code" id="ra_result">尚未操作</pre></div>
       </div>

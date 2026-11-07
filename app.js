@@ -20,6 +20,7 @@ const state = {
   ringSource: 'fallback',// 'api' 新后端环网接口 | 'fallback' 旧后端从展开树还原
   ringLinks: [],         // /api/ring-links 链路清单（环网链路管理页 + 节点详情计数）
   ringLinkEditId: null,  // 正在编辑的环网链路 id（null = 新增模式）
+  ringBreak: null,       // 环网未闭合时的唯一开链断点信息（供「补回缺失链路」使用）
   fullChains: [],        // 完整链路缓存：[{ root, d }]
   currentChain: null,    // 当前节点链路接口响应缓存（切换展示规则时免于重新 ping）
   fullFailed: [],        // 完整链路中查询失败的树
@@ -268,9 +269,8 @@ function chainQuerying(text) {
   $('chainTree').innerHTML = '<div class="empty">' + esc(text) + '</div>';
   state.chainTrees = [];
   clearTreeNote();
-  $('ringCanvas').innerHTML = '<div class="empty">' + esc(text) + '</div>';
-  $('ringNote').textContent = '';
-  $('ringLegend').innerHTML = '';
+  // 环形视图数据源是独立的 GET /api/topology/ring，不随采区链路查询被清空
+  if (state.chainView === 'ring') renderRingView();
 }
 
 function chainFailed(msg) {
@@ -278,9 +278,7 @@ function chainFailed(msg) {
   $('chainTree').innerHTML = '<div class="empty">无数据</div>';
   state.chainTrees = [];
   clearTreeNote();
-  $('ringCanvas').innerHTML = '<div class="empty">查询失败：' + esc(msg) + '</div>';
-  $('ringNote').textContent = '';
-  $('ringLegend').innerHTML = '';
+  if (state.chainView === 'ring') renderRingView();
 }
 
 /* ---------------- 采区树形视图：端口链路图 ----------------
@@ -699,6 +697,56 @@ function collectRingGraph(ring) {
   return { nodes, edges, adj, groupOf };
 }
 
+/**
+ * 闭环不成立时（删掉一条环边、或删除环网节点被外键级联删掉两侧链路），
+ * 把 RING 边还原成若干条「开链」，用于带缺口的环形展示。
+ * CHORD 不参与闭环，只作为直连弦显示。每条开链的两个端点就是待补回的断点。
+ */
+function ringOpenChains(ring) {
+  const adj = new Map();
+  const add = (a, b) => {
+    if (a == null || b == null) return;
+    if (!adj.has(a)) adj.set(a, new Set());
+    adj.get(a).add(b);
+  };
+  (ring.links || []).forEach(l => {
+    if (l.linkType && l.linkType !== 'RING') return;   // CHORD 不进环
+    add(l.fromNodeId, l.toNodeId);
+    add(l.toNodeId, l.fromNodeId);
+  });
+  const seen = new Set(), chains = [];
+  for (const start of adj.keys()) {
+    if (seen.has(start)) continue;
+    // 一个连通分量
+    const comp = [], queue = [start];
+    seen.add(start);
+    while (queue.length) {
+      const x = queue.shift();
+      comp.push(x);
+      for (const y of (adj.get(x) || [])) if (!seen.has(y)) { seen.add(y); queue.push(y); }
+    }
+    const ends = comp.filter(x => (adj.get(x) || new Set()).size === 1);
+    // 从端点沿未访问边走到底；分叉时优先走度数小的分支，剩余节点补在末尾
+    const path = [], used = new Set();
+    let cur = ends[0] || comp[0];
+    while (cur != null && !used.has(cur)) {
+      used.add(cur);
+      path.push(cur);
+      cur = [...(adj.get(cur) || [])]
+        .filter(y => !used.has(y))
+        .sort((a, b) => (adj.get(a) || new Set()).size - (adj.get(b) || new Set()).size)[0];
+    }
+    comp.forEach(x => { if (!used.has(x)) { used.add(x); path.push(x); } });
+    if (path.length >= 2) {
+      chains.push({
+        nodeIds: path,
+        ends: ends.length === 2 ? ends : [path[0], path[path.length - 1]]
+      });
+    }
+  }
+  return chains;
+}
+
 /** 旧后端兼容：仅从链路树的 parent_id 树边还原无向图（v2 起环网由 ring_link 提供）。 */
 function collectChainGraph(trees) {
   const nodes = new Map(), edges = new Map(), groupOf = new Map();
@@ -779,7 +827,10 @@ const ringGroupColor = gi => RING_COLORS[(gi || 0) % RING_COLORS.length];
 const ringEdgeKey = (a, b) => a < b ? a + '-' + b : b + '-' + a;
 
 /** 生成单个环的 SVG。 */
-function ringSvg(cycle, g, comp) {
+function ringSvg(cycle, g, comp, opts = {}) {
+  // closed=false：按开链排布，不画首尾相连的那段弧，缺口处画红色虚线标出断点
+  const closed = opts.closed !== false;
+  const breakInfo = opts.breakInfo || null;
   const n = cycle.length;
   const W = 900, H = 580, cx = W / 2, cy = H / 2, R = 196;
   // 逆时针排布：绿色左环在左、红色右环在右，与现场图纸方向一致
@@ -790,7 +841,7 @@ function ringSvg(cycle, g, comp) {
 
   // 环上相邻边：沿圆周画短弧，两端留出让节点圆不被线穿过的间隙
   const gap = Math.asin(Math.min(0.5, 15 / R));
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < (closed ? n : n - 1); i++) {
     const a = cycle[i], b = cycle[(i + 1) % n];
     const e = g.edges.get(ringEdgeKey(a, b));
     const ga = g.groupOf.get(a), gb = g.groupOf.get(b);
@@ -811,13 +862,30 @@ function ringSvg(cycle, g, comp) {
     }
   }
 
+  // 开链缺口：首尾本应相连却缺少的那段链路（通常是删除节点/链路后没有补回直连）
+  if (!closed) {
+    const [gx1, gy1] = pos(n - 1, R), [gx2, gy2] = pos(0, R);
+    const ends = breakInfo && breakInfo.ends ? breakInfo.ends : [];
+    const label = ends.length === 2
+      ? `✕ 缺失链路 #${ends[0]} ↔ #${ends[1]}` : '✕ 缺失链路';
+    parts.push(`<line class="ring-break-line" x1="${gx1.toFixed(1)}" y1="${gy1.toFixed(1)}" x2="${gx2.toFixed(1)}" y2="${gy2.toFixed(1)}"><title>${esc(label)}：补回这条链路即可恢复闭环</title></line>`);
+    // 标签放在圆内侧，避免与首尾两台设备向外的名称/IP 标签重叠
+    const [tx, ty] = pos(n - 0.5, R - 38);
+    const w = Math.max(96, label.length * 7 + 12);
+    parts.push(`<rect x="${(tx - w / 2).toFixed(1)}" y="${(ty - 9).toFixed(1)}" width="${w.toFixed(1)}" height="16" rx="3" fill="#fff" opacity=".95"/>`);
+    parts.push(`<text class="ring-break-label" x="${tx.toFixed(1)}" y="${(ty + 3).toFixed(1)}" text-anchor="middle">${esc(label)}</text>`);
+  }
+
   // 非环边：不参与闭环的直连链路，画成穿过环内的紫色虚线弦
   let chords = 0;
   g.edges.forEach(e => {
     if (!comp.has(e.a) || !comp.has(e.b)) return;
     if (!idx.has(e.a) || !idx.has(e.b)) return;
     const ia = idx.get(e.a), ib = idx.get(e.b);
-    if ((ia - ib + n) % n === 1 || (ib - ia + n) % n === 1) return;  // 已在环上
+    const adjacent = closed
+      ? ((ia - ib + n) % n === 1 || (ib - ia + n) % n === 1)
+      : (Math.abs(ia - ib) === 1);
+    if (adjacent) return;  // 已在环（或开链）上
     const [x1, y1] = pos(ia, R - 16), [x2, y2] = pos(ib, R - 16);
     parts.push(`<line class="ring-chord" x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"><title>#${e.a} ↔ #${e.b} · ${esc(e.labels.join(' / '))}</title></line>`);
     const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
@@ -860,6 +928,213 @@ function ringSvg(cycle, g, comp) {
   return { html: `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="环网拓扑图">${parts.join('')}</svg>`, nodes: n, chords };
 }
 
+/**
+ * 8 字双环合成图（v3.3）：左环 GREEN / 右环 RED 在腰部共享两台核心与一条 CORE 直连边，
+ * 共享节点全图只画一次；普通节点上挂的小环从该节点向外鼓出小圈。
+ * 数据来源是后端按 ring_no 显式组装的 cycles（ringMode=explicit）。
+ */
+function figure8Svg(ring, g) {
+  const cycles = (ring.cycles || []).filter(c =>
+    c.ringNo && Array.isArray(c.nodeIds) && c.nodeIds.length >= 3);
+  const mains = cycles.filter(c => !c.subRing && !/^sub/i.test(c.ringNo || ''));
+  const left = mains.find(c => c.ringNo === 'GREEN') || mains[0];
+  const right = mains.find(c => c.ringNo === 'RED') || mains.find(c => c !== left);
+  const subs = cycles.filter(c => c.subRing || /^sub/i.test(c.ringNo || ''));
+  if (!left || !right) return null;
+
+  // 两主环共用的腰部节点；把两个环都规整成「从 hubA 沿半椭圆走到 hubB」
+  const hubs = left.nodeIds.filter(id => right.nodeIds.includes(id));
+  const hubA = hubs.length ? Math.min(...hubs) : left.nodeIds[0];
+  const hubB = hubs.length > 1 ? Math.max(...hubs) : left.nodeIds[left.nodeIds.length - 1];
+  const order = ids => {
+    const i = ids.indexOf(hubA);
+    if (i < 0) return ids.slice();
+    const rot = [...ids.slice(i), ...ids.slice(0, i)];
+    if (rot.length > 2 && rot[1] === hubB) return [rot[0], ...rot.slice(1).reverse()];
+    return rot;
+  };
+  const L = order(left.nodeIds), R = order(right.nodeIds);
+
+  const W = 1180, H = 660, cx = W / 2, cy = H / 2 - 6;
+  const Rx = 296, Ry = 208, SR = 66;
+  const parts = [], posMap = new Map(), drawn = new Set();
+  const theta = (i, n) => -Math.PI / 2 + Math.PI * i / (n - 1);
+  const arcPt = (side, t) => [cx + side * Rx * Math.cos(t), cy + Ry * Math.sin(t)];
+  const edgeOf = (a, b) => g.edges.get(ringEdgeKey(a, b));
+  const labelOf = (a, b) => {
+    const e = edgeOf(a, b);
+    if (!e) return '';
+    const s = e.labels[0] || '';
+    return e.labels.length > 1 ? s + ' +' + (e.labels.length - 1) : s;
+  };
+  const sampleArc = (fn, t0, t1, steps = 10) => {
+    let d = '';
+    for (let k = 0; k <= steps; k++) {
+      const [x, y] = fn(t0 + (t1 - t0) * k / steps);
+      d += (k ? 'L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+    }
+    return d.trim();
+  };
+  const colorOf = no => no === 'GREEN' ? '#059669' : (no === 'RED' ? '#dc2626' : '#2563eb');
+
+  // ---- 主环两条半椭圆 ----
+  [[L, -1, left.ringNo], [R, 1, right.ringNo]].forEach(([ids, side, ringNo]) => {
+    const n = ids.length, gap = 0.022, color = colorOf(ringNo);
+    for (let i = 0; i < n - 1; i++) {
+      const a = ids[i], b = ids[i + 1];
+      drawn.add(ringEdgeKey(a, b));
+      const d = sampleArc(t => arcPt(side, t), theta(i, n) + gap, theta(i + 1, n) - gap);
+      parts.push(`<path class="ring-edge" d="${d}" stroke="${color}" fill="none"><title>#${a} ↔ #${b} · ${esc(labelOf(a, b) || ringNo)}</title></path>`);
+      if (state.showRingPorts) {
+        const [px, py] = arcPt(side, theta(i + 0.5, n));
+        const lab = labelOf(a, b);
+        if (lab) {
+          const lx = px + side * 18, w = Math.max(34, lab.length * 4.7 + 8);
+          parts.push(`<rect x="${(lx - w / 2).toFixed(1)}" y="${(py - 7).toFixed(1)}" width="${w.toFixed(1)}" height="14" rx="3" fill="#fff" opacity=".92"/>`);
+          parts.push(`<text class="ring-port" x="${lx.toFixed(1)}" y="${(py + 3.4).toFixed(1)}" text-anchor="middle">${esc(lab)}<title>相接端口：${esc(lab)}</title></text>`);
+        }
+      }
+    }
+    ids.forEach((id, i) => { if (!posMap.has(id)) posMap.set(id, arcPt(side, theta(i, n))); });
+  });
+
+  // ---- 腰部共享边（CORE 直连），两环共用同一条 ----
+  drawn.add(ringEdgeKey(hubA, hubB));
+  const coreLabel = labelOf(hubA, hubB);
+  parts.push(`<line class="ring-edge" x1="${cx}" y1="${(cy - Ry + 14).toFixed(1)}" x2="${cx}" y2="${(cy + Ry - 14).toFixed(1)}" stroke="#7c3aed" stroke-width="3"><title>#${hubA} ↔ #${hubB} · 8 字腰部共享直连 · ${esc(coreLabel)}</title></line>`);
+  if (state.showRingPorts && coreLabel) {
+    const w = Math.max(46, coreLabel.length * 5.2 + 10);
+    parts.push(`<rect x="${(cx + 8).toFixed(1)}" y="${(cy - 8).toFixed(1)}" width="${w.toFixed(1)}" height="16" rx="3" fill="#fff" opacity=".94"/>`);
+    parts.push(`<text class="ring-port" x="${(cx + 8 + w / 2).toFixed(1)}" y="${(cy + 3.5).toFixed(1)}" text-anchor="middle">${esc(coreLabel)}</text>`);
+  }
+  parts.push(`<text class="ring-waist" x="${cx}" y="26" text-anchor="middle">左环 GREEN / 右环 RED · 腰部共享两台核心与一条 CORE 直连</text>`);
+
+  // ---- 附属小环：从挂接节点向外鼓出；挂接点相邻时沿切向错开，避免多个小圆重叠 ----
+  const subCenters = [];
+  subs.forEach((sub, si) => {
+    let ids = sub.nodeIds.slice();
+    const anchor = sub.anchorNodeId != null ? sub.anchorNodeId : ids[0];
+    const ai = ids.indexOf(anchor);
+    if (ai > 0) ids = [...ids.slice(ai), ...ids.slice(0, ai)];
+    if (!posMap.has(anchor)) return;
+    const [ax, ay] = posMap.get(anchor);
+    let vx = ax - cx, vy = ay - cy;
+    const len = Math.hypot(vx, vy) || 1;
+    let dx = vx / len, dy = vy / len, radius = SR;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const px = ax + dx * radius, py = ay + dy * radius;
+      if (!subCenters.some(([qx, qy]) => Math.hypot(qx - px, qy - py) < SR * 1.7)) break;
+      // 先向一侧偏转，再向另一侧偏转，仍冲突则同时把小环拉远一点
+      const turn = (attempt % 2 ? -1 : 1) * (0.55 + 0.2 * Math.floor(attempt / 2));
+      const nx = dx * Math.cos(turn) - dy * Math.sin(turn);
+      const ny = dx * Math.sin(turn) + dy * Math.cos(turn);
+      dx = nx; dy = ny;
+      if (attempt % 2) radius = SR * (1.22 + 0.08 * Math.floor(attempt / 2));
+    }
+    const ccx = ax + dx * radius, ccy = ay + dy * radius;
+    subCenters.push([ccx, ccy]);
+    const phi0 = Math.atan2(-dy, -dx);
+    const m = ids.length;
+    const spt = k => {
+      const p = phi0 + 2 * Math.PI * k / m;
+      return [ccx + SR * Math.cos(p), ccy + SR * Math.sin(p)];
+    };
+    const color = ['#2563eb', '#ea580c', '#0891b2', '#7c3aed'][si % 4];
+    for (let k = 0; k < m; k++) {
+      const a = ids[k], b = ids[(k + 1) % m];
+      drawn.add(ringEdgeKey(a, b));
+      const p0 = phi0 + 2 * Math.PI * k / m, p1 = phi0 + 2 * Math.PI * (k + 1) / m;
+      const d = sampleArc(t => [ccx + SR * Math.cos(t), ccy + SR * Math.sin(t)], p0 + 0.03, p1 - 0.03, 8);
+      parts.push(`<path class="ring-edge ring-sub-edge" d="${d}" stroke="${color}" fill="none"><title>小环 ${esc(sub.ringNo)} · #${a} ↔ #${b} · ${esc(labelOf(a, b))}</title></path>`);
+    }
+    ids.forEach((id, k) => { if (!posMap.has(id)) posMap.set(id, spt(k)); });
+    const title = `小环 · ${esc(sub.ringNo || '')}`;
+    parts.push(`<text class="ring-sub-title" x="${(ccx + dx * (SR + 34)).toFixed(1)}" y="${(ccy + dy * (SR + 34)).toFixed(1)}" text-anchor="middle">${title}</text>`);
+  });
+
+  // ---- 其余跨接弦（真·非环直连）----
+  let chords = 0;
+  g.edges.forEach(e => {
+    if (drawn.has(ringEdgeKey(e.a, e.b))) return;
+    const p1 = posMap.get(e.a), p2 = posMap.get(e.b);
+    if (!p1 || !p2) return;
+    parts.push(`<line class="ring-chord" x1="${p1[0].toFixed(1)}" y1="${p1[1].toFixed(1)}" x2="${p2[0].toFixed(1)}" y2="${p2[1].toFixed(1)}"><title>#${e.a} ↔ #${e.b} · ${esc(e.labels.join(' / '))}</title></line>`);
+    chords++;
+  });
+
+  // ---- 节点（共享节点只画一次）----
+  const isHub = id => id === hubA || id === hubB;
+  const subIds = new Set();
+  subs.forEach(s => (s.nodeIds || []).forEach(id => {
+    if (id !== s.anchorNodeId) subIds.add(id);
+  }));
+  posMap.forEach(([x, y], id) => {
+    const node = g.nodes.get(id) || {};
+    const deg = (g.adj.get(id) || new Set()).size;
+    const core = isHub(id) || deg > 2;
+    const sel = state.selected === id;
+    const color = core ? '#7c3aed'
+      : (subIds.has(id) ? '#2563eb' : colorOf(g.groupOf.get(id) === 1 ? 'RED' : 'GREEN'));
+    const r = core ? 13 : (posMap.size > 24 ? 10 : 11);
+    const st = node.status === 'ONLINE' ? '#059669' : (node.status === 'OFFLINE' ? '#dc2626' : '#cbd5e1');
+    const side = x < cx ? -1 : 1;
+    const lx = x + (isHub(id) ? 0 : side * 18);
+    const anchorTxt = isHub(id) ? 'middle' : (side < 0 ? 'end' : 'start');
+    const ly = isHub(id) ? (y < cy ? y - 26 : y + 26) : y;
+    const raw = String(node.deviceName || ('#' + id));
+    const lines = raw.length > 8 ? [raw.slice(0, Math.ceil(raw.length / 2)), raw.slice(Math.ceil(raw.length / 2), Math.ceil(raw.length / 2) + 9)] : [raw];
+    const tspan = lines.map((t, k) => `<tspan x="${lx.toFixed(1)}" dy="${k ? 12 : 0}">${esc(t)}</tspan>`).join('')
+      + (node.ipAddress ? `<tspan class="ring-ip" x="${lx.toFixed(1)}" dy="12">${esc(node.ipAddress)}</tspan>` : '');
+    parts.push(`<g class="ring-node" data-id="${id}">
+      <title>#${id} ${esc(node.deviceName || '')} · ${esc(node.ipAddress || '无 IP')} · ${esc(node.status || 'UNKNOWN')}${core ? ' · 共享枢纽' : ''}</title>
+      ${sel ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r + 7}" fill="#dbeafe" opacity=".9"/>` : ''}
+      <circle class="rn-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" fill="${sel ? '#2563eb' : (core ? '#f5f3ff' : '#fff')}" stroke="${sel ? '#1d4ed8' : color}" stroke-width="${sel ? 3.5 : 2.5}"/>
+      <text class="ring-id" x="${x.toFixed(1)}" y="${(y + 3.3).toFixed(1)}" text-anchor="middle" fill="${sel ? '#fff' : '#334155'}">${id}</text>
+      <circle cx="${(x + r * 0.75).toFixed(1)}" cy="${(y - r * 0.75).toFixed(1)}" r="3.2" fill="${st}" stroke="#fff" stroke-width="1"/>
+      <text class="ring-label" x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" text-anchor="${anchorTxt}" dominant-baseline="middle">${tspan}</text>
+    </g>`);
+  });
+
+  return {
+    html: `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="8 字双环拓扑图">${parts.join('')}</svg>`,
+    nodes: posMap.size, chords,
+    left: L.length, right: R.length, subs: subs.length,
+    hubA, hubB,
+    subNames: subs.map(s => ({ ringNo: s.ringNo, anchor: s.anchorNodeId, count: s.nodeIds.length }))
+  };
+}
+
+/** 新版后端（ringMode=explicit）走合成 8 字图，旧版仍走「每环一张图」兼容渲染。 */
+function renderFigure8(ring, g, box, note, legend) {
+  const fig = figure8Svg(ring, g);
+  if (!fig) return false;
+  const nm = id => {
+    const n = g.nodes.get(id) || {};
+    return `#${id} ${n.deviceName || ''}`;
+  };
+  const subText = fig.subNames.length
+    ? ` · <b>${fig.subNames.length}</b> 个附属小环（${esc(fig.subNames.map(s =>
+        `${s.ringNo} 挂在 ${nm(s.anchor)} · ${s.count} 台`).join('；'))}）`
+    : '';
+  box.innerHTML = `<div class="ring-group-title">8 字双环 · 左环 GREEN ${fig.left} 台 / 右环 RED ${fig.right} 台`
+    + ` · 腰部共享 ${esc(nm(fig.hubA))} 与 ${esc(nm(fig.hubB))} 及一条直连边${subText}</div>` + fig.html;
+  note.innerHTML = `<b>8 字双环</b> · 图上 <b>${fig.nodes}</b> 台设备（共享节点只画一次）`
+    + ` · <b>${fig.chords}</b> 条非环直连弦${subText}`
+    + ' · 实线弧为环上物理链路（悬停看相接端口），中间紫色竖线为两环共享的腰部直连'
+    + ' · 节点标注名称与 IP，点击节点查看详情'
+    + ' · <b>数据来源：GET /api/topology/ring（按 ring_no 显式组装物理环）</b>';
+  legend.innerHTML = '<span class="lg"><i class="sw" style="border-color:#059669"></i>左环 GREEN</span>'
+    + '<span class="lg"><i class="sw" style="border-color:#dc2626"></i>右环 RED</span>'
+    + '<span class="lg"><i class="sw" style="border-color:#7c3aed"></i>腰部共享直连（CORE）</span>'
+    + (fig.subNames.length ? '<span class="lg"><i class="sw" style="border-color:#2563eb"></i>节点附属小环</span>' : '')
+    + '<span class="lg"><i class="sw p" style="border-color:#7c3aed"></i>非环直连弦</span>'
+    + '<span class="lg"><i class="dotc core"></i>共享枢纽</span>'
+    + '<span class="lg"><i class="dotc"></i>环网交换机</span>'
+    + '<span class="lg"><i class="dotc sel"></i>当前选中</span>';
+  bindRingClicks();
+  return true;
+}
+
 /** 切换树形 / 环形展示。 */
 function setChainView(v) {
   state.chainView = v;
@@ -885,7 +1160,14 @@ function renderRingView() {
     note.textContent = ''; legend.innerHTML = '';
     return;
   }
+  // v3.3：后端按现场标注还原了物理环，直接合成一张 8 字图（共享核心只画一次）
+  if (useApi && ring.ringMode === 'explicit'
+      && Array.isArray(ring.cycles) && ring.cycles.some(c => c.ringNo)) {
+    state.ringBreak = null;
+    if (renderFigure8(ring, g, box, note, legend)) return;
+  }
   const svgs = [], offRing = [], shownCycles = [];
+  let openChains = [];
   if (useApi) {
     // 后端已按环基识别全部独立环：主环 + 挂在环上节点的小环，每个环单独成图
     const cycles = (Array.isArray(ring.cycles) && ring.cycles.length)
@@ -897,8 +1179,21 @@ function renderRingView() {
       svgs.push(ringSvg(c.nodeIds, g, new Set(c.nodeIds)));
       shownCycles.push(c);
     });
-    if (!cycles.length && (ring.chords || []).length) offRing.push((ring.nodes || []).length);
+    if (!cycles.length) {
+      // 闭环不成立（删节点被外键级联删链路、或直接删了一条环边）时，
+      // 仍用现存 RING 边还原开链展示并标出断点，不能让整张图空白。
+      openChains = ringOpenChains(ring);
+      openChains.forEach(o => {
+        svgs.push(ringSvg(o.nodeIds, g, new Set(o.nodeIds), { closed: false, breakInfo: o }));
+        shownCycles.push({ nodeIds: o.nodeIds, sharedNodeIds: [], main: true, open: true, ends: o.ends });
+      });
+      state.ringBreak = openChains.length === 1 ? openChains[0] : null;
+      if (!openChains.length && (ring.chords || []).length) offRing.push((ring.nodes || []).length);
+    } else {
+      state.ringBreak = null;
+    }
   } else {
+    state.ringBreak = null;
     graphComponents(g).forEach(comp => {
       const cycle = findMainCycle(g, comp);
       if (cycle.length < 3) { offRing.push(comp.size); return; }
@@ -911,28 +1206,53 @@ function renderRingView() {
     note.textContent = ''; legend.innerHTML = '';
     return;
   }
-  box.innerHTML = svgs.map((s, i) => {
+  const brk = state.ringBreak;
+  const breakName = id => {
+    if (id == null) return '—';
+    const n = g.nodes.get(id) || {};
+    return `#${id} ${n.deviceName || ''}${n.ipAddress ? ' (' + n.ipAddress + ')' : ''}`;
+  };
+  const breakBar = brk
+    ? `<div class="ring-break-bar"><b>⚠ 环网未闭合</b>：现存 ${brk.nodeIds.length - 1} 条环上链路把 ${brk.nodeIds.length} 台设备连成一条开链，`
+      + `断点为 <b>${esc(breakName(brk.ends[0]))}</b> ↔ <b>${esc(breakName(brk.ends[1]))}</b>（图中红色虚线）。`
+      + '常见原因是删除环网节点时被外键级联删掉两侧链路，或删除环上链路后没有补直连。'
+      + '<button id="btnRepairRing" class="btn btn-primary btn-sm">补回缺失链路（恢复闭环）</button></div>'
+    : (openChains.length > 1
+      ? `<div class="ring-break-bar"><b>⚠ 环网未闭合</b>：检测到 ${openChains.length} 段彼此不相连的开链，请到「◎ 环网链路」页逐段补齐链路。</div>`
+      : '');
+  box.innerHTML = breakBar + svgs.map((s, i) => {
     const c = shownCycles[i] || {};
     const shared = (c.sharedNodeIds || []).map(id => {
       const n = g.nodes.get(id) || {};
       return `#${id} ${n.deviceName || ''}${n.ipAddress ? ' (' + n.ipAddress + ')' : ''}`;
     });
-    const head = (svgs.length > 1 || shared.length)
-      ? `<div class="ring-group-title">${c.main && svgs.length > 1 ? '主环' : '环状结构'} ${i + 1}/${svgs.length}`
-        + ` · ${s.nodes} 台设备` + (shared.length ? ` · 跨环共享节点：${esc(shared.join('、'))}` : '') + '</div>'
-      : '';
+    const head = c.open
+      ? `<div class="ring-group-title">开链视图 ${i + 1}/${svgs.length} · ${s.nodes} 台设备`
+        + ` · 断点：${esc(breakName((c.ends || [])[0]))} ↔ ${esc(breakName((c.ends || [])[1]))}</div>`
+      : ((svgs.length > 1 || shared.length)
+        ? `<div class="ring-group-title">${c.main && svgs.length > 1 ? '主环' : '环状结构'} ${i + 1}/${svgs.length}`
+          + ` · ${s.nodes} 台设备` + (shared.length ? ` · 跨环共享节点：${esc(shared.join('、'))}` : '') + '</div>'
+        : '');
     return head + s.html;
   }).join('');
   const totalNodes = svgs.reduce((a, x) => a + x.nodes, 0);
   const totalChords = svgs.reduce((a, x) => a + x.chords, 0);
-  note.innerHTML = `<b>${svgs.length}</b> 个环状结构 · 图上 <b>${totalNodes}</b> 个节点位（跨环共享节点会在各环重复出现）`
-    + ` · <b>${totalChords}</b> 条非环直连弦`
-    + (offRing.length ? ` · <b>${offRing.reduce((a, b) => a + b, 0)}</b> 台未入环` : '')
-    + ' · 圆弧为环上物理链路（悬停查看相接端口），节点标注名称与 IP，紫色虚线为直连弦 · 点击节点查看详情'
+  const sourceNote = useApi
+    ? ' · <b>数据来源：GET /api/topology/ring（ring_link 独立建模）</b>'
+    : ' · <b>数据来源：旧后端兼容模式（从展开树还原）</b>';
+  note.innerHTML = (brk || openChains.length)
+    ? `<b>⚠ 当前未形成闭环</b> · ${svgs.length} 段开链 · 图上 <b>${totalNodes}</b> 个节点位`
+      + ` · <b>${totalChords}</b> 条非环直连弦`
+      + ' · 实线弧为现存环上链路（悬停看相接端口），红色虚线为缺失链路，紫色虚线为直连弦 · 点击节点查看详情'
+      + sourceNote
+    : `<b>${svgs.length}</b> 个环状结构 · 图上 <b>${totalNodes}</b> 个节点位（跨环共享节点会在各环重复出现）`
+      + ` · <b>${totalChords}</b> 条非环直连弦`
+      + (offRing.length ? ` · <b>${offRing.reduce((a, b) => a + b, 0)}</b> 台未入环` : '')
+      + ' · 圆弧为环上物理链路（悬停查看相接端口），节点标注名称与 IP，紫色虚线为直连弦 · 点击节点查看详情'
+      + sourceNote;
+  legend.innerHTML = ((brk || openChains.length)
+      ? '<span class="lg"><i class="sw p" style="border-color:#dc2626"></i>缺失链路（断点）</span>' : '')
     + (useApi
-      ? ' · <b>数据来源：GET /api/topology/ring（ring_link 独立建模）</b>'
-      : ' · <b>数据来源：旧后端兼容模式（从展开树还原）</b>');
-  legend.innerHTML = (useApi
     ? '<span class="lg"><i class="sw" style="border-color:#2563eb"></i>环上物理链路（悬停看连接端口）</span>'
       + '<span class="lg"><i class="sw p" style="border-color:#7c3aed"></i>非环直连弦</span>'
     : Array.from({ length: Math.min(4, Math.max(1, new Set(g.groupOf.values()).size)) }, (_, i) =>
@@ -985,6 +1305,58 @@ async function renderRingPortList(ring) {
 function bindRingClicks() {
   $('ringCanvas').querySelectorAll('.ring-node').forEach(el =>
     el.addEventListener('click', () => selectNode(Number(el.dataset.id))));
+  const btn = $('btnRepairRing');
+  if (btn) btn.addEventListener('click', repairRingBreak);
+}
+
+/**
+ * 补回开链断点两端缺失的那条环上链路，恢复闭环。
+ * 端口自动取两端尚未被任何 ring_link 占用的空闲口；环编号/顺序继承断点两侧的相邻链路。
+ * 只在用户点「补回缺失链路」并二次确认后才写库。
+ */
+async function repairRingBreak() {
+  const brk = state.ringBreak, ring = state.ringTopology;
+  if (!brk || !ring || (brk.ends || []).length !== 2) return toast('当前没有可自动修复的唯一断点', 'err');
+  const [a, b] = brk.ends;
+  if (a === b) return toast('断点两端相同，请到「◎ 环网链路」页手动补链', 'err');
+  const nameOf = id => {
+    const n = (ring.nodes || []).find(x => x.id === id) || {};
+    return `#${id} ${n.deviceName || ''}${n.ipAddress ? ' (' + n.ipAddress + ')' : ''}`;
+  };
+  const usedPortIds = new Set((ring.links || [])
+    .flatMap(l => [l.fromPortId, l.toPortId]).filter(x => x != null));
+  const freePortOf = async id => {
+    const r = await api('GET', `/api/nodes/${id}/ports`);
+    const list = r.ok && Array.isArray(r.data) ? r.data : [];
+    return list.find(p => !usedPortIds.has(p.id)) || null;
+  };
+  const [pa, pb] = await Promise.all([freePortOf(a), freePortOf(b)]);
+  const near = (ring.links || []).filter(l => l.linkType !== 'CHORD'
+    && [l.fromNodeId, l.toNodeId].some(x => x === a || x === b));
+  const ringNos = [...new Set(near.map(l => l.ringNo).filter(Boolean))];
+  const ringNo = ringNos.length === 1 ? ringNos[0] : 'MAIN';
+  const seqs = near.map(l => l.seqNo).filter(x => Number.isFinite(x));
+  const seqNo = seqs.length ? Math.min(...seqs) + 1 : null;
+  const lo = Math.min(a, b), hi = Math.max(a, b);
+  const pLo = a < b ? pa : pb, pHi = a < b ? pb : pa;
+  const payload = {
+    fromNodeId: lo, toNodeId: hi,
+    fromPortId: pLo ? pLo.id : null,
+    toPortId: pHi ? pHi.id : null,
+    ringNo, seqNo, linkType: 'RING',
+    remark: `恢复环网断点：${nameOf(lo)} ↔ ${nameOf(hi)}`
+  };
+  const tip = '将补回一条环上链路，恢复闭环：\n'
+    + `${nameOf(lo)} · ${pLo ? pLo.portNo : '未指定端口'}\n`
+    + `↔ ${nameOf(hi)} · ${pHi ? pHi.portNo : '未指定端口'}\n`
+    + `环编号 ${ringNo} · 顺序 ${seqNo ?? '—'} · 类型 RING\n\n确认执行？`;
+  if (!confirm(tip)) return;
+  const r = await api('POST', '/api/ring-links', payload);
+  if (!r.ok) return toast('补链失败：' + r.message, 'err');
+  toast('已补回缺失链路，环网闭环已恢复', 'ok');
+  await loadRingLinks();
+  await loadRingTopology();
+  renderRingView();
 }
 
 /** 查询当前节点链路：当前选中节点所属的那棵树。 */
@@ -1386,7 +1758,14 @@ async function deleteNode() {
   const id = state.selected;
   if (!id) return toast('请先选择节点', 'err');
   const n = nodeById(id);
-  if (!confirm(`确认删除节点 #${id} ${n ? n.deviceName : ''}？\n若存在子节点，后端会拒绝删除。`)) return;
+  const ringRefs = (state.ringLinks || []).filter(l => l.fromNodeId === id || l.toNodeId === id).length;
+  const isRingMember = (state.ringTopology?.nodes || []).some(x => x.id === id);
+  const warn = (ringRefs || isRingMember)
+    ? `\n\n⚠ 这是环网成员节点（当前 ${ringRefs} 条环网链路）。后端会拒绝直接删除；`
+      + '若先手工删链路再删节点，ring_link 会被外键级联删除，闭环就断了。'
+      + '\n建议改用「◎ 环网链路 → 环网调整 → 摘除节点 · 邻居自动直连」，它会在同一事务里把两个邻居直连、保持闭环。'
+    : '';
+  if (!confirm(`确认删除节点 #${id} ${n ? n.deviceName : ''}？\n若存在子节点，后端会拒绝删除。${warn}`)) return;
   const r = await api('DELETE', `/api/nodes/${id}`);
   showResult('linkResult', r);
   if (r.ok) {
@@ -1460,6 +1839,8 @@ async function onRingNodeChange(side) {
 function resetRingLinkForm() {
   state.ringLinkEditId = null;
   $('rl_formTitle').textContent = '新增环网链路';
+  // 编辑小环链路时动态补的选项，退出编辑后清掉，避免误选成历史编号
+  [...$('rl_ringNo').options].forEach(o => { if (/^SUB\d+$/i.test(o.value)) o.remove(); });
   $('rl_ringNo').value = 'GREEN';
   $('rl_seqNo').value = '';
   $('rl_linkType').value = 'RING';
@@ -1476,7 +1857,13 @@ async function editRingLink(id) {
   if (!l) return toast('链路不存在', 'err');
   state.ringLinkEditId = l.id;
   $('rl_formTitle').textContent = `编辑环网链路 #${l.id}`;
-  $('rl_ringNo').value = l.ringNo || 'MAIN';
+  // 固定下拉只有 GREEN/RED/CORE/MAIN；编辑 SUBn 小环链路时补一个临时选项，
+  // 否则赋值会落空、保存时被改成 MAIN，把小环链路踢出物理环组装。
+  const ringSel = $('rl_ringNo'), no = l.ringNo || 'MAIN';
+  if (![...ringSel.options].some(o => o.value === no)) {
+    ringSel.add(new Option(no + ' · 小环链路', no));
+  }
+  ringSel.value = no;
   $('rl_seqNo').value = l.seqNo ?? '';
   $('rl_linkType').value = l.linkType || 'RING';
   $('rl_remark').value = l.remark || '';
@@ -1556,18 +1943,22 @@ function renderRingAdjustOptions() {
   setOpts('ra_rw_link', (state.ringLinks || []).slice().sort((a, b) => a.id - b.id), l => l.id,
     l => `#${l.id} ${l.fromNodeName || '#' + l.fromNodeId} (${l.fromPortNo || '—'}) ↔ `
       + `${l.toNodeName || '#' + l.toNodeId} (${l.toPortNo || '—'})`, '请选择链路');
+  setOpts('ra_sr_anchor', subRingAnchorCandidates(), n => n.id, raLabel, '请选择主环节点');
   syncRewireEnds();
   previewBypass();
   previewRewire();
+  syncSubRingDefaults();
+  previewSubRing();
 }
 
 function switchRingAdjustOp() {
   const op = $('ra_op').value;
-  ['bypass', 'rewire'].forEach(k => {
+  ['bypass', 'rewire', 'subring'].forEach(k => {
     const el = $('ra_' + k), show = op === k;
     el.hidden = !show;
     el.style.display = show ? '' : 'none';
   });
+  if (op === 'subring') { syncSubRingDefaults(); previewSubRing(); }
 }
 
 function syncRewireEnds() {
@@ -1684,6 +2075,111 @@ async function execRewire() {
   if (!r.ok) return;
   await refreshAfterRingAdjust();
   toast((r.data && r.data.message) || '链路已改接', 'ok');
+}
+
+/* ---------------- 环网调整：新增小环 ----------------
+ * 后端 POST /api/ring-links/sub-rings 单事务建「两台交换机 + 六个光口 + 三条 SUBn 链路」，
+ * 小环组内自闭环，PhysicalRingAssembler 会把与主环共用的节点标为 anchorNodeId，
+ * 前端 8 字图据此从挂接点向外鼓出一个小圆。
+ */
+function subRingAnchorCandidates() {
+  const cycles = state.ringTopology?.cycles || [];
+  const mainIds = new Set();
+  const subIds = new Set();
+  cycles.forEach(c => {
+    if (!Array.isArray(c.nodeIds)) return;
+    const isSub = c.subRing || /^sub/i.test(c.ringNo || '');
+    c.nodeIds.forEach(id => (isSub ? subIds : mainIds).add(Number(id)));
+  });
+  // 挂接点本身同时出现在主环与已有小环里，仍可作为另一个小环的挂接点
+  subIds.forEach(id => { if (mainIds.has(id)) subIds.delete(id); });
+  return ringDeviceList().filter(n => {
+    const id = Number(n.id);
+    if (subIds.has(id)) return false;
+    const full = state.nodes.find(x => Number(x.id) === id);
+    if (full && Number(full.nodeLevel) === 0) return false;   // 排除主备核心
+    return mainIds.size ? mainIds.has(id) : true;             // 断环回退时不误杀
+  });
+}
+
+/** 留空时后端自动分配的编号，这里只用于界面预览。 */
+function nextSubRingNo() {
+  let max = 0;
+  (state.ringLinks || []).forEach(l => {
+    const m = /^SUB(\d+)$/i.exec(l.ringNo || '');
+    if (m) max = Math.max(max, Number(m[1]));
+  });
+  return 'SUB' + (max + 1);
+}
+
+/** 选中挂接点后自动填两台设备名；用户手动改过的输入框不再覆盖。 */
+function syncSubRingDefaults() {
+  const sel = $('ra_sr_anchor');
+  if (!sel) return;
+  // 首次进入时默认选中第一个候选节点，让结构预览立即可见
+  if (!sel.value && sel.options.length > 1) sel.value = sel.options[1].value;
+  if (!sel.value) return;
+  const n = ringDeviceList().find(x => Number(x.id) === Number(sel.value));
+  if (!n) return;
+  const base = n.deviceName || ('#' + n.id);
+  [['ra_sr_aName', 'A'], ['ra_sr_bName', 'B']].forEach(([id, suffix]) => {
+    const el = $(id);
+    if (!el.value.trim() || el.dataset.auto === '1') {
+      el.value = `${base} 小环交换机${suffix}`;
+      el.dataset.auto = '1';
+    }
+  });
+}
+
+function previewSubRing() {
+  const box = $('ra_sr_preview');
+  if (!box) return;
+  const id = Number($('ra_sr_anchor').value);
+  const n = ringDeviceList().find(x => Number(x.id) === id);
+  if (!id || !n) { box.innerHTML = '选择挂接节点后显示将要创建的小环结构'; return; }
+  const no = ($('ra_sr_ringNo').value.trim() || nextSubRingNo()).toUpperCase();
+  const base = n.deviceName || ('#' + id);
+  const a = $('ra_sr_aName').value.trim() || `${base} 小环交换机A`;
+  const b = $('ra_sr_bName').value.trim() || `${base} 小环交换机B`;
+  box.innerHTML = `将在 <b>#${esc(id)} ${esc(n.deviceName || '')}</b> 上新增 <b>${esc(no)}</b> 小环：`
+    + `<br>① #${esc(id)} ↔ ${esc(a)} <span class="hint">seq 1</span>`
+    + `<br>② ${esc(a)} ↔ ${esc(b)} <span class="hint">seq 2</span>`
+    + `<br>③ ${esc(b)} ↔ #${esc(id)} <span class="hint">seq 3</span>`
+    + '<br>后端自动创建 2 台 RING 交换机、6 个光口与 3 条链路；'
+    + '环形视图会立即在挂接点外侧多出一个小圆。';
+}
+
+async function execSubRing() {
+  const anchorNodeId = Number($('ra_sr_anchor').value);
+  if (!anchorNodeId) return toast('请选择挂接节点', 'err');
+  const no = $('ra_sr_ringNo').value.trim();
+  if (no && !/^SUB\d+$/i.test(no)) return toast('小环编号必须形如 SUB2，或留空自动分配', 'err');
+  const val = id => $(id).value.trim();
+  const spec = (nameId, ipId) => {
+    const o = {};
+    if (val(nameId)) o.deviceName = val(nameId);
+    if (val(ipId)) o.ipAddress = val(ipId);
+    if (val('ra_sr_model')) o.deviceModel = val('ra_sr_model');
+    if (val('ra_sr_location')) o.location = val('ra_sr_location');
+    return Object.keys(o).length ? o : null;
+  };
+  const payload = {
+    anchorNodeId,
+    ringNo: no || null,
+    deviceA: spec('ra_sr_aName', 'ra_sr_aIp'),
+    deviceB: spec('ra_sr_bName', 'ra_sr_bIp'),
+    remark: val('ra_sr_remark') || null
+  };
+  if (!confirm(`确认在节点 #${anchorNodeId} 上新增${no ? ' ' + no : ''}小环？\n`
+    + '将真实写入 2 台交换机、6 个光口和 3 条闭环链路；单事务执行，失败自动回滚。')) return;
+  const r = await api('POST', '/api/ring-links/sub-rings', payload);
+  showResult('ra_result', r);
+  if (!r.ok) return;
+  await refreshAfterRingAdjust();
+  $('ra_sr_ringNo').value = '';
+  $('ra_sr_remark').value = '';
+  previewSubRing();
+  toast((r.data && r.data.message) || '小环已新增', 'ok');
 }
 
 /* ---------------- 端口管理 ---------------- */
@@ -1900,6 +2396,11 @@ function bindEvents() {
   $('ra_rw_old').addEventListener('change', () => { syncKeepPort(); previewRewire(); });
   $('ra_rw_new').addEventListener('change', onRewireNewChange);
   $('ra_rw_exec').addEventListener('click', execRewire);
+  $('ra_sr_anchor').addEventListener('change', () => { syncSubRingDefaults(); previewSubRing(); });
+  ['ra_sr_ringNo', 'ra_sr_aName', 'ra_sr_bName', 'ra_sr_remark'].forEach(id => {
+    $(id).addEventListener('input', () => { $(id).dataset.auto = '0'; previewSubRing(); });
+  });
+  $('ra_sr_exec').addEventListener('click', execSubRing);
 
   // 端口管理
   $('p_switch').addEventListener('change', () => { resetPortForm(); refreshPortView(); });

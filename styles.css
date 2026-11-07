@@ -191,6 +191,15 @@ textarea.input{resize:vertical}
 .ring-edge{fill:none;stroke-width:3;stroke-linecap:round}
 .ring-chord{stroke:#7c3aed;stroke-width:2;stroke-dasharray:6 5;opacity:.8}
 .ring-chord-label{font-size:10px;fill:#7c3aed;font-weight:600}
+.ring-break-bar{margin:0 0 10px;padding:10px 12px;border:1px solid #fecaca;background:#fff7f7;border-radius:9px;font-size:12px;color:#991b1b;line-height:1.75}
+.ring-break-bar b{color:#b91c1c}
+.ring-break-bar .btn{margin-left:10px;vertical-align:middle}
+.ring-break-line{stroke:#dc2626;stroke-width:2.5;stroke-dasharray:7 6;opacity:.85}
+.ring-break-label{font-size:10.5px;fill:#b91c1c;font-weight:700}
+/* 8 字双环合成图：腰部标注、附属小环 */
+.ring-waist{font-size:10.5px;fill:#7c3aed;font-weight:650}
+.ring-sub-edge{stroke-width:2.6;stroke-linecap:round}
+.ring-sub-title{font-size:10px;fill:#2563eb;font-weight:700}
 
 /* ---------- 端口链路图（树形视图：上级端口 ↔ 下级接入端口 + 空闲端口） ---------- */
 .tree{max-height:720px}
